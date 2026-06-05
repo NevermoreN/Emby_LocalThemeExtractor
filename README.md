@@ -1,0 +1,95 @@
+# Local Theme Extractor - Emby Plugin
+
+从本地媒体文件中提取主题曲的 Emby 插件，无需依赖任何外部下载服务。
+
+## 功能
+
+- **电视剧**：利用 Emby 已有的片头标记（Intro Markers），用 ffmpeg 从本地媒体文件中提取片头音乐作为 `theme.mp3`
+- **电视剧片尾回退**：对没有片头标记的电视剧，自动检测片尾并提取片尾音乐
+- **电影**：通过音频静音检测（silencedetect）和视频黑帧检测（blackdetect）定位片尾字幕起始点，提取片尾音乐
+- **固定窗口兜底**：对无黑帧、无静音的电影，可选提取最后 N 秒作为主题曲
+
+## 特性
+
+- **零外部依赖**：仅使用 Emby 自带的 ffmpeg，不需要网络下载
+- **内存管道处理**：ffmpeg 通过 `pipe:1` 输出到内存，无中间临时文件
+- **带宽优化**：使用 `-map 0:a:0` 仅读取音频流，对 CloudDrive/网盘 FUSE 挂载场景大幅节省流量
+- **三级检测策略**：silencedetect（~2MB）→ blackdetect（~200MB）→ 固定窗口（0 额外 I/O）
+- **GPU 加速**：blackdetect 支持 nvdec/vaapi 等硬件视频解码
+- **只读文件系统感知**：自动检测并跳过不可写的挂载点，避免浪费检测流量
+- **支持 .strm 文件**：自动解析 strm 内容获取实际媒体路径
+- **多媒体库选择**：GenericEdit UI 界面，支持多选媒体库
+
+## 安装
+
+1. 从 [Releases](../../releases) 下载 `LocalThemeExtractor.dll`
+2. 将 DLL 复制到 Emby 的插件目录：
+   - Docker: `/config/plugins/`
+   - Windows: `%AppData%\Emby-Server\plugins\`
+3. 重启 Emby Server
+
+## 构建
+
+```bash
+dotnet build src/LocalThemeExtractor.csproj -c Release
+```
+
+输出文件：`src/bin/Release/netstandard2.0/LocalThemeExtractor.dll`
+
+## 配置
+
+安装后在 Emby 管理后台 → 插件 → Local Theme Extractor 中配置：
+
+| 选项 | 说明 | 默认值 |
+|------|------|--------|
+| 媒体库范围 | 选择要处理的媒体库（不选 = 全部） | 全部 |
+| 并行线程数 | 同时处理数量 | 1 |
+| 覆盖已有 | 已存在 theme.mp3 时是否重新提取 | 否 |
+| 提取片头 | 使用 Emby 片头标记提取电视剧主题曲 | 是 |
+| 优先季数 | 优先从第几季提取（0=最早有标记的季） | 1 |
+| 最短片头秒数 | 低于此值视为广告，跳过 | 20 |
+| 片尾回退 | 无片头标记时尝试检测片尾 | 否 |
+| 电影片尾检测 | 检测电影片尾黑帧/静音并提取 | 是 |
+| 片尾扫描秒数 | 从片尾往前扫描多少秒 | 600 |
+| 片尾最短秒数 | 检测到的片尾低于此值不提取 | 30 |
+| 固定窗口回退 | 检测失败时提取最后 N 秒 | 否 |
+| 回退窗口秒数 | 固定窗口提取长度 | 90 |
+| 硬件解码 | 启用 GPU 加速（blackdetect 时有效） | 否 |
+| 解码器名称 | nvdec / vaapi / videotoolbox / dxva2 | nvdec |
+| 音频码率 | 输出 MP3 码率 | 192 kbps |
+
+## 检测策略
+
+```
+电视剧（有片头标记）：
+  直接从标记时间段提取 → theme.mp3
+
+电视剧（无片头标记，启用回退）：
+  silencedetect → blackdetect → 跳过
+
+电影：
+  silencedetect（~2MB）
+    ↓ 命中 → 提取
+    ↓ 未命中
+  blackdetect（~200MB）
+    ↓ 命中 → 提取
+    ↓ 未命中
+  固定窗口（可选）
+    ↓ 启用 → 提取最后 N 秒
+    ↓ 未启用 → 跳过
+```
+
+## 计划任务
+
+插件注册为 Emby 计划任务「提取本地主题曲」，默认每周日凌晨 3 点自动执行。也可在 Emby 管理后台 → 计划任务中手动触发。
+
+## 兼容性
+
+- Emby Server 4.8+
+- .NET Standard 2.0
+- Linux / Windows / macOS（需要 ffmpeg 可用）
+- Docker 容器（linuxserver/emby 等）
+
+## License
+
+[MIT](LICENSE)
