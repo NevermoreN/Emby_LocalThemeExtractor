@@ -1,6 +1,6 @@
 # Local Theme Extractor - Emby Plugin
 
-从本地媒体文件中提取主题曲的 Emby 插件，无需依赖任何外部下载服务。
+从本地媒体文件中提取主题曲(Emby Theme Songs)的 Emby 插件，无需依赖任何外部下载服务。
 
 ## 功能
 
