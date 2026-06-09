@@ -132,13 +132,27 @@ namespace LocalThemeExtractor
             if (string.IsNullOrEmpty(mediaUrl)) return;
 
             string outputPath = Path.Combine(seriesDir, "theme.mp3");
+            double startSec = marker.StartSec;
+            double endSec   = marker.EndSec;
 
-            _logger.Info("[LTE] 电视剧 [{0}] S{1:D2}E{2:D2} {3:F1}s-{4:F1}s",
-                ep.SeriesName, ep.SeasonNumber, ep.EpisodeNumber,
-                marker.StartSec, marker.EndSec);
+            // 3+ failures: skip markers, extract last 30s as fallback
+            if (tracker.ShouldFallbackExtract(key))
+            {
+                double? totalDur = await FfmpegHelper.ProbeDurationAsync(mediaUrl, _logger, ct);
+                if (totalDur == null || totalDur < 60) return;
+                startSec = totalDur.Value - 30;
+                endSec   = totalDur.Value - 5;
+                _logger.Info("[LTE] 电视剧兜底截取最后30s [{0}]", ep.SeriesName);
+            }
+            else
+            {
+                _logger.Info("[LTE] 电视剧 [{0}] S{1:D2}E{2:D2} {3:F1}s-{4:F1}s",
+                    ep.SeriesName, ep.SeasonNumber, ep.EpisodeNumber,
+                    startSec, endSec);
+            }
 
             byte[] audioData = await FfmpegHelper.ExtractAudioToMemoryAsync(
-                mediaUrl, marker.StartSec, marker.EndSec,
+                mediaUrl, startSec, endSec,
                 config.AudioBitrateKbps, config.UseHwDecode, config.HwDecoderName,
                 _logger, ct);
 
@@ -207,25 +221,37 @@ namespace LocalThemeExtractor
             if (totalDur == null || totalDur < config.MovieMinCreditsSeconds + 60) return;
 
             double creditsEnd = totalDur.Value - 5;
-            var range = await DetectExtractRange(
-                mediaUrl, totalDur.Value, creditsEnd,
-                config.MovieCreditsLookbackSeconds, config.MovieMinCreditsSeconds,
-                config.UseHwDecode, config.HwDecoderName, false, 0, ct);
+            double extractStart, extractEnd;
 
-            if (range == null)
+            // 3+ failures: skip detection, extract last 30s
+            if (tracker.ShouldFallbackExtract(key))
             {
-                int count = tracker.RecordFailure(key);
-                _logger.Info("[LTE] 回退：未检测到片尾起点（第{0}次）：{1}", count, ep.SeriesName);
-                return;
+                extractStart = totalDur.Value - 30;
+                extractEnd   = creditsEnd;
+                _logger.Info("[LTE] 回退兜底截取最后30s [{0}]", ep.SeriesName);
+            }
+            else
+            {
+                var range = await DetectExtractRange(
+                    mediaUrl, totalDur.Value, creditsEnd,
+                    config.MovieCreditsLookbackSeconds, config.MovieMinCreditsSeconds,
+                    config.UseHwDecode, config.HwDecoderName, false, 0, ct);
+
+                if (range == null)
+                {
+                    int count = tracker.RecordFailure(key);
+                    _logger.Info("[LTE] 回退：未检测到片尾起点（第{0}次）：{1}", count, ep.SeriesName);
+                    return;
+                }
+                extractStart = range.Value.Item1;
+                extractEnd   = range.Value.Item2;
+
+                _logger.Info("[LTE] 电视剧片尾回退 [{0}] S{1:D2}E{2:D2} {3:F1}s-{4:F1}s",
+                    ep.SeriesName, ep.SeasonNumber, ep.EpisodeNumber,
+                    extractStart, extractEnd);
             }
 
-            double extractStart = range.Value.Item1;
-            double extractEnd   = range.Value.Item2;
             string outputPath = Path.Combine(seriesDir, "theme.mp3");
-
-            _logger.Info("[LTE] 电视剧片尾回退 [{0}] S{1:D2}E{2:D2} {3:F1}s-{4:F1}s",
-                ep.SeriesName, ep.SeasonNumber, ep.EpisodeNumber,
-                extractStart, extractEnd);
 
             byte[] audioData = await FfmpegHelper.ExtractAudioToMemoryAsync(
                 mediaUrl, extractStart, extractEnd,
@@ -297,25 +323,36 @@ namespace LocalThemeExtractor
             if (totalDur == null || totalDur < config.MovieMinCreditsSeconds + 60) return;
 
             double creditsEnd = totalDur.Value - 5;
+            double extractStart, extractEnd;
 
-            var range = await DetectExtractRange(
-                mediaUrl, totalDur.Value, creditsEnd,
-                config.MovieCreditsLookbackSeconds, config.MovieMinCreditsSeconds,
-                config.UseHwDecode, config.HwDecoderName,
-                config.MovieFallbackToEndWindow, config.MovieFallbackWindowSeconds, ct);
-
-            if (range == null)
+            // 3+ failures: skip detection, extract last 30s
+            if (tracker.ShouldFallbackExtract(key))
             {
-                int count = tracker.RecordFailure(key);
-                _logger.Info("[LTE] 电影：所有检测均无结果（第{0}次）：{1}", count, movie.Name);
-                return;
+                extractStart = totalDur.Value - 30;
+                extractEnd   = creditsEnd;
+                _logger.Info("[LTE] 电影兜底截取最后30s [{0}]", movie.Name);
             }
+            else
+            {
+                var range = await DetectExtractRange(
+                    mediaUrl, totalDur.Value, creditsEnd,
+                    config.MovieCreditsLookbackSeconds, config.MovieMinCreditsSeconds,
+                    config.UseHwDecode, config.HwDecoderName,
+                    config.MovieFallbackToEndWindow, config.MovieFallbackWindowSeconds, ct);
 
-            double extractStart = range.Value.Item1;
-            double extractEnd   = range.Value.Item2;
-            if (extractEnd - extractStart < 10) return;
+                if (range == null)
+                {
+                    int count = tracker.RecordFailure(key);
+                    _logger.Info("[LTE] 电影：所有检测均无结果（第{0}次）：{1}", count, movie.Name);
+                    return;
+                }
 
-            _logger.Info("[LTE] 电影提取 [{0}] {1:F1}s-{2:F1}s", movie.Name, extractStart, extractEnd);
+                extractStart = range.Value.Item1;
+                extractEnd   = range.Value.Item2;
+                if (extractEnd - extractStart < 10) return;
+
+                _logger.Info("[LTE] 电影提取 [{0}] {1:F1}s-{2:F1}s", movie.Name, extractStart, extractEnd);
+            }
 
             byte[] audioData = await FfmpegHelper.ExtractAudioToMemoryAsync(
                 mediaUrl, extractStart, extractEnd,
