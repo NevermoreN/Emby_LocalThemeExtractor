@@ -28,15 +28,8 @@ namespace LocalThemeExtractor
 
         public IEnumerable<TaskTriggerInfo> GetDefaultTriggers()
         {
-            return new[]
-            {
-                new TaskTriggerInfo
-                {
-                    Type        = TaskTriggerInfo.TriggerWeekly,
-                    DayOfWeek   = DayOfWeek.Sunday,
-                    TimeOfDayTicks = TimeSpan.FromHours(3).Ticks
-                }
-            };
+            // No auto trigger — user runs manually from Emby dashboard
+            return Array.Empty<TaskTriggerInfo>();
         }
 
         // ── Execute ──────────────────────────────────────────────────────
@@ -52,6 +45,8 @@ namespace LocalThemeExtractor
 
             var enabledLibs = ParseLibraryScope(config.LibraryScope);
 
+            var tracker = new FailureTracker(3);
+
             _logger.Info("[LTE] 任务开始。线程={0}，媒体库={1}",
                 config.MaxParallelism,
                 enabledLibs == null ? "全部" : string.Join(",", enabledLibs));
@@ -64,18 +59,18 @@ namespace LocalThemeExtractor
                            config.TvExtractIntro ? 50 : 0;
 
             if (config.TvExtractIntro)
-                processedSeriesIds = await ProcessTv(config, enabledLibs, progress, 0, tvEnd, cancellationToken);
+                processedSeriesIds = await ProcessTv(config, enabledLibs, tracker, progress, 0, tvEnd, cancellationToken);
 
             // ── TV fallback (credits) ──────────────────────────────────
             double tvFallbackEnd = config.MovieExtractCredits ? 50 : 100;
             if (config.TvFallbackToCredits)
-                await ProcessTvFallback(config, enabledLibs, processedSeriesIds,
+                await ProcessTvFallback(config, enabledLibs, processedSeriesIds, tracker,
                     progress, tvEnd, tvFallbackEnd, cancellationToken);
 
             // ── Movies ─────────────────────────────────────────────────
             double movieFrom = (config.TvExtractIntro || config.TvFallbackToCredits) ? 50 : 0;
             if (config.MovieExtractCredits)
-                await ProcessMovies(config, enabledLibs, progress, movieFrom, 100, cancellationToken);
+                await ProcessMovies(config, enabledLibs, tracker, progress, movieFrom, 100, cancellationToken);
 
             progress.Report(100);
             _logger.Info("[LTE] 任务完成");
@@ -84,7 +79,7 @@ namespace LocalThemeExtractor
         // ── TV series processing ─────────────────────────────────────────
 
         private async Task<HashSet<long>> ProcessTv(
-            LteOptions config, HashSet<string> enabledLibs,
+            LteOptions config, HashSet<string> enabledLibs, FailureTracker tracker,
             IProgress<double> progress, double pctFrom, double pctTo,
             CancellationToken ct)
         {
@@ -98,22 +93,27 @@ namespace LocalThemeExtractor
                 allSeriesWithIntro.Add(item.Item1.SeriesItemId);
 
             var pending = new List<(LibraryDbHelper.EpisodeInfo, LibraryDbHelper.IntroMarker)>();
+            int skippedBlacklist = 0;
             foreach (var item in seriesList)
             {
+                string key = "tv:" + item.Item1.SeriesItemId;
+                if (tracker.IsBlacklisted(key)) { skippedBlacklist++; continue; }
                 string seriesDir = GetSeriesDir(item.Item1);
                 if (string.IsNullOrEmpty(seriesDir)) continue;
                 string themeFile = Path.Combine(seriesDir, "theme.mp3");
                 if (!config.OverwriteExisting && File.Exists(themeFile))
                 {
-                    _logger.Debug("[LTE] 跳过（已有）: {0}", item.Item1.SeriesName);
+                    tracker.RecordSuccess(key);
                     continue;
                 }
                 pending.Add(item);
             }
 
+            if (skippedBlacklist > 0)
+                _logger.Info("[LTE] 电视剧：{0} 个系列因多次失败已跳过", skippedBlacklist);
             _logger.Info("[LTE] 电视剧：待处理 {0} 个系列", pending.Count);
             await RunParallel(pending, config,
-                async (item, cfg, tok) => { await ProcessOneTvSeries(item.Item1, item.Item2, cfg, tok); },
+                async (item, cfg, tok) => { await ProcessOneTvSeries(item.Item1, item.Item2, cfg, tracker, tok); },
                 progress, pctFrom, pctTo, ct);
 
             return allSeriesWithIntro;
@@ -121,15 +121,12 @@ namespace LocalThemeExtractor
 
         private async Task ProcessOneTvSeries(
             LibraryDbHelper.EpisodeInfo ep, LibraryDbHelper.IntroMarker marker,
-            LteOptions config, CancellationToken ct)
+            LteOptions config, FailureTracker tracker, CancellationToken ct)
         {
+            string key = "tv:" + ep.SeriesItemId;
             string seriesDir = GetSeriesDir(ep);
             if (string.IsNullOrEmpty(seriesDir)) return;
-            if (!IsDirectoryWritable(seriesDir))
-            {
-                _logger.Debug("[LTE] 目录不可写，跳过：{0}", ep.SeriesName);
-                return;
-            }
+            if (!IsDirectoryWritable(seriesDir)) return;
 
             string mediaUrl = StrmHelper.ResolveMediaUrl(ep.Path);
             if (string.IsNullOrEmpty(mediaUrl)) return;
@@ -148,11 +145,13 @@ namespace LocalThemeExtractor
             if (audioData != null)
             {
                 WriteThemeFile(outputPath, audioData);
+                tracker.RecordSuccess(key);
                 _logger.Info("[LTE] 电视剧保存：{0}", outputPath);
             }
             else
             {
-                _logger.Warn("[LTE] 电视剧提取失败：{0}", ep.SeriesName);
+                int count = tracker.RecordFailure(key);
+                _logger.Warn("[LTE] 电视剧提取失败（第{0}次）：{1}", count, ep.SeriesName);
             }
         }
 
@@ -160,7 +159,7 @@ namespace LocalThemeExtractor
 
         private async Task ProcessTvFallback(
             LteOptions config, HashSet<string> enabledLibs,
-            HashSet<long> excludeSeriesIds,
+            HashSet<long> excludeSeriesIds, FailureTracker tracker,
             IProgress<double> progress, double pctFrom, double pctTo,
             CancellationToken ct)
         {
@@ -168,31 +167,38 @@ namespace LocalThemeExtractor
             _logger.Info("[LTE] 电视剧片尾回退：共 {0} 个无片头标记的系列", episodes.Count);
 
             var pending = new List<LibraryDbHelper.EpisodeInfo>();
+            int skippedBlacklist = 0;
             foreach (var ep in episodes)
             {
+                string key = "tvfb:" + ep.SeriesItemId;
+                if (tracker.IsBlacklisted(key)) { skippedBlacklist++; continue; }
                 string seriesDir = GetSeriesDir(ep);
                 if (string.IsNullOrEmpty(seriesDir)) continue;
                 string themeFile = Path.Combine(seriesDir, "theme.mp3");
-                if (!config.OverwriteExisting && File.Exists(themeFile)) continue;
+                if (!config.OverwriteExisting && File.Exists(themeFile))
+                {
+                    tracker.RecordSuccess(key);
+                    continue;
+                }
                 pending.Add(ep);
             }
 
+            if (skippedBlacklist > 0)
+                _logger.Info("[LTE] 电视剧片尾回退：{0} 个系列因多次失败已跳过", skippedBlacklist);
             _logger.Info("[LTE] 电视剧片尾回退：待处理 {0} 个系列", pending.Count);
             await RunParallel(pending, config,
-                async (ep, cfg, tok) => { await ProcessOneTvSeriesFallback(ep, cfg, tok); },
+                async (ep, cfg, tok) => { await ProcessOneTvSeriesFallback(ep, cfg, tracker, tok); },
                 progress, pctFrom, pctTo, ct);
         }
 
         private async Task ProcessOneTvSeriesFallback(
-            LibraryDbHelper.EpisodeInfo ep, LteOptions config, CancellationToken ct)
+            LibraryDbHelper.EpisodeInfo ep, LteOptions config,
+            FailureTracker tracker, CancellationToken ct)
         {
+            string key = "tvfb:" + ep.SeriesItemId;
             string seriesDir = GetSeriesDir(ep);
             if (string.IsNullOrEmpty(seriesDir)) return;
-            if (!IsDirectoryWritable(seriesDir))
-            {
-                _logger.Debug("[LTE] 回退：目录不可写，跳过：{0}", ep.SeriesName);
-                return;
-            }
+            if (!IsDirectoryWritable(seriesDir)) return;
 
             string mediaUrl = StrmHelper.ResolveMediaUrl(ep.Path);
             if (string.IsNullOrEmpty(mediaUrl)) return;
@@ -200,7 +206,6 @@ namespace LocalThemeExtractor
             double? totalDur = await FfmpegHelper.ProbeDurationAsync(mediaUrl, _logger, ct);
             if (totalDur == null || totalDur < config.MovieMinCreditsSeconds + 60) return;
 
-            // Detect extract range: silencedetect (cheap) → blackdetect (expensive)
             double creditsEnd = totalDur.Value - 5;
             var range = await DetectExtractRange(
                 mediaUrl, totalDur.Value, creditsEnd,
@@ -209,7 +214,8 @@ namespace LocalThemeExtractor
 
             if (range == null)
             {
-                _logger.Info("[LTE] 回退：未检测到片尾起点：{0}", ep.SeriesName);
+                int count = tracker.RecordFailure(key);
+                _logger.Info("[LTE] 回退：未检测到片尾起点（第{0}次）：{1}", count, ep.SeriesName);
                 return;
             }
 
@@ -229,18 +235,20 @@ namespace LocalThemeExtractor
             if (audioData != null)
             {
                 WriteThemeFile(outputPath, audioData);
+                tracker.RecordSuccess(key);
                 _logger.Info("[LTE] 电视剧片尾回退保存：{0}", outputPath);
             }
             else
             {
-                _logger.Warn("[LTE] 电视剧片尾回退失败：{0}", ep.SeriesName);
+                int count = tracker.RecordFailure(key);
+                _logger.Warn("[LTE] 电视剧片尾回退失败（第{0}次）：{1}", count, ep.SeriesName);
             }
         }
 
         // ── Movie processing ─────────────────────────────────────────────
 
         private async Task ProcessMovies(
-            LteOptions config, HashSet<string> enabledLibs,
+            LteOptions config, HashSet<string> enabledLibs, FailureTracker tracker,
             IProgress<double> progress, double pctFrom, double pctTo,
             CancellationToken ct)
         {
@@ -248,34 +256,41 @@ namespace LocalThemeExtractor
             _logger.Info("[LTE] 电影：共 {0} 部", movies.Count);
 
             var pending = new List<LibraryDbHelper.MovieInfo>();
+            int skippedBlacklist = 0;
             foreach (var movie in movies)
             {
                 if (string.IsNullOrEmpty(movie.Path)) continue;
+                string key = "movie:" + movie.ItemId;
+                if (tracker.IsBlacklisted(key)) { skippedBlacklist++; continue; }
                 string dir = GetMovieDir(movie.Path);
                 if (string.IsNullOrEmpty(dir)) continue;
                 string themeFile = Path.Combine(dir, "theme.mp3");
-                if (!config.OverwriteExisting && File.Exists(themeFile)) continue;
+                if (!config.OverwriteExisting && File.Exists(themeFile))
+                {
+                    tracker.RecordSuccess(key);
+                    continue;
+                }
                 pending.Add(movie);
             }
 
+            if (skippedBlacklist > 0)
+                _logger.Info("[LTE] 电影：{0} 部因多次失败已跳过", skippedBlacklist);
             _logger.Info("[LTE] 电影：待处理 {0} 部", pending.Count);
             await RunParallel(pending, config,
-                async (movie, cfg, tok) => { await ProcessOneMovie(movie, cfg, tok); },
+                async (movie, cfg, tok) => { await ProcessOneMovie(movie, cfg, tracker, tok); },
                 progress, pctFrom, pctTo, ct);
         }
 
         private async Task ProcessOneMovie(
-            LibraryDbHelper.MovieInfo movie, LteOptions config, CancellationToken ct)
+            LibraryDbHelper.MovieInfo movie, LteOptions config,
+            FailureTracker tracker, CancellationToken ct)
         {
+            string key = "movie:" + movie.ItemId;
             string mediaUrl = StrmHelper.ResolveMediaUrl(movie.Path);
             if (string.IsNullOrEmpty(mediaUrl)) return;
 
-            string movieDir   = GetMovieDir(movie.Path);
-            if (!IsDirectoryWritable(movieDir))
-            {
-                _logger.Debug("[LTE] 电影目录不可写，跳过：{0}", movie.Name);
-                return;
-            }
+            string movieDir = GetMovieDir(movie.Path);
+            if (!IsDirectoryWritable(movieDir)) return;
             string outputPath = Path.Combine(movieDir, "theme.mp3");
 
             double? totalDur = await FfmpegHelper.ProbeDurationAsync(mediaUrl, _logger, ct);
@@ -283,7 +298,6 @@ namespace LocalThemeExtractor
 
             double creditsEnd = totalDur.Value - 5;
 
-            // Detect: silencedetect (2MB) → blackdetect (200MB) → fixed window
             var range = await DetectExtractRange(
                 mediaUrl, totalDur.Value, creditsEnd,
                 config.MovieCreditsLookbackSeconds, config.MovieMinCreditsSeconds,
@@ -292,7 +306,8 @@ namespace LocalThemeExtractor
 
             if (range == null)
             {
-                _logger.Info("[LTE] 电影：所有检测均无结果，跳过：{0}", movie.Name);
+                int count = tracker.RecordFailure(key);
+                _logger.Info("[LTE] 电影：所有检测均无结果（第{0}次）：{1}", count, movie.Name);
                 return;
             }
 
@@ -310,11 +325,13 @@ namespace LocalThemeExtractor
             if (audioData != null)
             {
                 WriteThemeFile(outputPath, audioData);
+                tracker.RecordSuccess(key);
                 _logger.Info("[LTE] 电影保存：{0}", outputPath);
             }
             else
             {
-                _logger.Warn("[LTE] 电影提取失败：{0}", movie.Name);
+                int count = tracker.RecordFailure(key);
+                _logger.Warn("[LTE] 电影提取失败（第{0}次）：{1}", count, movie.Name);
             }
         }
 
