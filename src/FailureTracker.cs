@@ -8,7 +8,10 @@ namespace LocalThemeExtractor
 {
     /// <summary>
     /// Tracks per-item extraction failures in a persistent JSON file.
-    /// Items that fail >= MaxRetries times are permanently skipped.
+    /// Three tiers:
+    ///   count &lt; 3  → normal detection + extraction
+    ///   count 3-5  → skip detection, extract last 30s as fallback
+    ///   count &gt;= 6 → permanently skip (truly hopeless)
     /// Thread-safe for concurrent access from parallel tasks.
     /// </summary>
     internal class FailureTracker
@@ -26,10 +29,16 @@ namespace LocalThemeExtractor
             _failures = Load();
         }
 
-        /// <summary>Has this item already failed too many times?</summary>
+        /// <summary>count >= 6: truly give up, skip permanently.</summary>
         public bool IsBlacklisted(string key)
         {
-            return _failures.TryGetValue(key, out int count) && count >= _maxRetries;
+            return _failures.TryGetValue(key, out int count) && count >= _maxRetries * 2;
+        }
+
+        /// <summary>count 3-5: normal detection failed 3 times, use last-30s fallback.</summary>
+        public bool ShouldFallbackExtract(string key)
+        {
+            return _failures.TryGetValue(key, out int count) && count >= _maxRetries && count < _maxRetries * 2;
         }
 
         /// <summary>Record a failure. Returns the new failure count.</summary>
