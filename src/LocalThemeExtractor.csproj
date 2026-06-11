@@ -8,7 +8,19 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.Memory" Version="4.5.5" />
-    <PackageReference Include="MediaBrowser.Common" Version="4.8.0.24-beta" />
-    <PackageReference Include="MediaBrowser.Server.Core" Version="4.8.0.24-beta" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="MediaBrowser.Model">
+      <HintPath>/docker/code-server/config/.nuget/packages/mediabrowser.common/4.8.0.24-beta/lib/netstandard2.0/MediaBrowser.Model.dll</HintPath>
+    </Reference>
+    <Reference Include="Emby.Web.GenericEdit">
+      <HintPath>/docker/code-server/config/.nuget/packages/mediabrowser.common/4.8.0.24-beta/lib/netstandard2.0/Emby.Web.GenericEdit.dll</HintPath>
+    </Reference>
+    <Reference Include="MediaBrowser.Controller">
+      <HintPath>/docker/code-server/config/.nuget/packages/mediabrowser.server.core/4.8.0.24-beta/lib/netstandard2.0/MediaBrowser.Controller.dll</HintPath>
+    </Reference>
+    <Reference Include="MediaBrowser.Common">
+      <HintPath>/docker/code-server/config/.nuget/packages/mediabrowser.common/4.8.0.24-beta/lib/netstandard2.0/MediaBrowser.Common.dll</HintPath>
+    </Reference>
   </ItemGroup>
 </Project>
