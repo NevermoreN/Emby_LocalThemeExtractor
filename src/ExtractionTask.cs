@@ -36,6 +36,22 @@ namespace LocalThemeExtractor
 
         public async Task Execute(CancellationToken cancellationToken, IProgress<double> progress)
         {
+            try
+            {
+                await ExecuteCore(cancellationToken, progress);
+            }
+            catch (System.IO.FileNotFoundException ex)
+            {
+                _logger.Error("[LTE] 缺少依赖: {0}。这通常由其他插件（如 StrmAssistant）引起，不影响本插件功能。请检查 Emby 安装完整性。", ex.FileName ?? ex.Message);
+            }
+            catch (Exception ex)
+            {
+                _logger.ErrorException("[LTE] 任务异常终止", ex);
+            }
+        }
+
+        private async Task ExecuteCore(CancellationToken cancellationToken, IProgress<double> progress)
+        {
             var config = Plugin.Instance?.GetCurrentOptions() ?? new LteOptions();
 
             _logger.Info("[LTE] CONFIG: Instance={0} LibraryScope='{1}' Overwrite={2}",
