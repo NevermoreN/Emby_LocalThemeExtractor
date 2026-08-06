@@ -6,7 +6,7 @@ An Emby plugin that extracts theme songs from local media files using ffmpeg —
 
 ## Features
 
-- **TV Intro Extraction**: Uses Emby's existing intro markers to extract opening theme music as `theme.mp3`
+- **TV Intro Extraction**: Uses Emby's existing intro markers to extract opening theme music as `theme.mp3`; samples S01E02 by default (episode 1 often has a cold open / no OP) and skips the whole series if that episode has no qualified marker
 - **TV Credits Fallback**: For shows without intro markers, automatically detects ending credits and extracts ending music
 - **Movie Credits Extraction**: Uses audio silence detection and video black-frame detection to locate credits and extract ending music
 - **Fixed Window Fallback**: For movies with no detectable black frames or silence, optionally extracts the last N seconds
@@ -23,6 +23,8 @@ An Emby plugin that extracts theme songs from local media files using ffmpeg —
 - **Persistent Failure Tracking**: Failure counts saved to `/config/data/lte-failures.json`, preserved across task runs
 - **STRM File Support**: Automatically resolves strm files to actual media paths
 - **Multi-Library Selection**: GenericEdit UI with multi-select library picker
+- **Post-Run Library Scan**: Automatically triggers a library scan when new theme.mp3 files were written, so Emby registers them immediately (no scan on empty runs)
+- **48 kHz Output**: MP3 keeps the native 48 kHz sample rate of film/TV audio instead of resampling to 44.1 kHz
 
 ## Installation
 
@@ -45,7 +47,8 @@ An Emby plugin that extracts theme songs from local media files using ffmpeg —
 | Overwrite Existing | Re-extract even if theme.mp3 exists | No |
 | **TV Shows** | | |
 | Extract Intro | Use Emby intro markers | Yes |
-| Prefer Season | Prefer which season (0 = earliest with markers) | 1 |
+| Prefer Season | Season to sample from (0 = earliest with markers; required 0 for shows without season numbers) | 1 |
+| Prefer Episode | Episode of the target season to sample; series is skipped entirely if it has no qualified marker | 2 |
 | Min Intro Seconds | Skip intros shorter than this (likely ads) | 20 |
 | Fallback to Credits | Detect ending credits when no intro markers exist | No |
 | **Movies** | | |
@@ -63,7 +66,8 @@ An Emby plugin that extracts theme songs from local media files using ffmpeg —
 
 ```
 TV Shows (with intro markers):
-  Extract directly from marker timestamps → theme.mp3
+  Sample only "Prefer Season × Prefer Episode" (default S01E02) → theme.mp3
+  Episode missing or marker unqualified → skip whole series (also excluded from credits fallback)
 
 TV Shows (no intro markers, fallback enabled):
   silencedetect → blackdetect → skip
