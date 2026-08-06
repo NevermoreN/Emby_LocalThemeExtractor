@@ -41,9 +41,17 @@ public class LteOptions : EditableOptionsBase
 
 
 	[DisplayName("优先使用第几季（1 = 第 1 季，0 = 最早有标记的季）")]
+	[Description("设为 0 时取有片头标记的最早正季；无季号的剧集（绝对集数编排的动画）只有设为 0 才会被匹配。")]
 	[MinValue(0)]
 	[MaxValue(99)]
 	public int TvPreferSeasonNumber { get; set; } = 1;
+
+
+	[DisplayName("从第几集采样（2 = 第 2 集；该集没有合格片头标记则整部剧跳过）")]
+	[Description("第 1 集常有冷开场、片头位置不同甚至没有 OP，第 2 集才是片头的稳定形态。找不到这一集就不采，不会退而求其次选别的集。")]
+	[MinValue(1)]
+	[MaxValue(99)]
+	public int TvPreferEpisodeNumber { get; set; } = 2;
 
 
 	[DisplayName("最短片头时长（秒），低于此值视为广告，跳过")]

@@ -92,8 +92,22 @@ internal static class LibraryDbHelper
 		return result;
 	}
 
-	public static List<(EpisodeInfo ep, IntroMarker intro)> GetIntroEpisodesPerSeries(int preferSeason = 1, int minIntroSeconds = 20, ICollection<string> libraryIds = null)
+	/// <summary>
+	/// 每部剧挑一集作为主题曲来源。
+	/// 规则：只认「目标季的第 preferEpisode 集」（默认 S01E02）——第 1 集常有冷开场、
+	/// 片头位置不同甚至没有 OP，第 2 集才是这部剧片头的稳定形态。
+	/// 目标季 = preferSeason；preferSeason 传 0 时取有片头标记的最早正季；若整部剧
+	/// 都没有正季号（无季号/绝对集数编排的动画，DB 里季号为 NULL→0），则按季 0 匹配。
+	/// 存在正季时 S00 特别篇仍被排除——特别篇的片头往往和正片不是一首。
+	/// 目标集不存在（或该集没有合格的片头标记）就整部剧跳过，不退而求其次选别的集。
+	/// 跳过的数量通过 skippedNoTargetEpisode 返回；allMarkedSeriesIds 返回**所有**有合格
+	/// 片头标记的系列 Id（含被跳过的）——调用方必须用它做片尾回退的排除表，否则被
+	/// 跳过的剧会漏进片尾回退线被改做片尾提取。
+	/// </summary>
+	public static List<(EpisodeInfo ep, IntroMarker intro)> GetIntroEpisodesPerSeries(int preferSeason, int preferEpisode, int minIntroSeconds, ICollection<string> libraryIds, out int skippedNoTargetEpisode, out HashSet<long> allMarkedSeriesIds)
 	{
+		skippedNoTargetEpisode = 0;
+		allMarkedSeriesIds = new HashSet<long>();
 		List<(EpisodeInfo, IntroMarker)> list = new List<(EpisodeInfo, IntroMarker)>();
 		if (!File.Exists(DbPath))
 		{
@@ -181,6 +195,9 @@ internal static class LibraryDbHelper
 		{
 			return list;
 		}
+		// 在按目标集过滤之前记下所有有合格标记的系列——排除表的语义必须是
+		// 「有片头标记」而不是「命中了目标集」
+		allMarkedSeriesIds.UnionWith(seriesMap.Keys);
 		string text3 = string.Join(",", seriesMap.Keys);
 		Dictionary<long, string> seriesPaths = new Dictionary<long, string>();
 		SqliteReader.Query(DbPath, "SELECT Id, Path FROM MediaItems WHERE type = " + 6 + "   AND Id IN (" + text3 + ")", delegate(Func<int, object> read)
@@ -191,21 +208,47 @@ internal static class LibraryDbHelper
 		});
 		foreach (KeyValuePair<long, List<(EpisodeInfo, IntroMarker)>> item4 in seriesMap)
 		{
-			List<(EpisodeInfo, IntroMarker)> value = item4.Value;
-			value.Sort(delegate((EpisodeInfo, IntroMarker) a, (EpisodeInfo, IntroMarker) b)
+			List<(EpisodeInfo, IntroMarker)> candidates = item4.Value;
+
+			// 目标季。preferSeason > 0 时锁定该季（默认 1）；传 0 时取有片头标记的最早
+			// 正季。全剧都没有正季号 = 无季号编排（绝对集数动画，DB 里季号 NULL→0），
+			// 不是特别篇，此时按季 0 匹配；存在正季时 S00 特别篇仍被排除。
+			int targetSeason = preferSeason;
+			if (targetSeason <= 0)
 			{
-				int num = ((a.Item1.SeasonNumber != preferSeason) ? 1 : 0);
-				int num2 = ((b.Item1.SeasonNumber != preferSeason) ? 1 : 0);
-				if (num != num2)
+				targetSeason = int.MaxValue;
+				foreach (var c in candidates)
 				{
-					return num.CompareTo(num2);
+					if (c.Item1.SeasonNumber > 0 && c.Item1.SeasonNumber < targetSeason)
+					{
+						targetSeason = c.Item1.SeasonNumber;
+					}
 				}
-				return (a.Item1.SeasonNumber != b.Item1.SeasonNumber) ? a.Item1.SeasonNumber.CompareTo(b.Item1.SeasonNumber) : a.Item1.EpisodeNumber.CompareTo(b.Item1.EpisodeNumber);
-			});
-			(EpisodeInfo, IntroMarker) tuple = value[0];
-			var (item, _) = tuple;
-			seriesPaths.TryGetValue(item.SeriesItemId, out item.SeriesPath);
-			list.Add((item, tuple.Item2));
+				if (targetSeason == int.MaxValue)
+				{
+					targetSeason = 0;
+				}
+			}
+
+			// 只认目标季的第 preferEpisode 集。这一集没有（或它的片头标记没通过
+			// minIntroSeconds 过滤）就整部剧跳过，不回退到其它集。
+			bool picked = false;
+			foreach (var c in candidates)
+			{
+				if (c.Item1.SeasonNumber != targetSeason || c.Item1.EpisodeNumber != preferEpisode)
+				{
+					continue;
+				}
+				EpisodeInfo item = c.Item1;
+				seriesPaths.TryGetValue(item.SeriesItemId, out item.SeriesPath);
+				list.Add((item, c.Item2));
+				picked = true;
+				break;
+			}
+			if (!picked)
+			{
+				skippedNoTargetEpisode++;
+			}
 		}
 		return list;
 	}

@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Logging;
 using MediaBrowser.Model.Tasks;
 
@@ -17,13 +18,18 @@ namespace LocalThemeExtractor
         public string Category    => "Local Theme Extractor";
 
         private readonly ILogger _logger;
+        private readonly ILibraryManager _libraryManager;
 
         // Cache writable check per mount root to avoid repeated I/O (thread-safe)
         private readonly ConcurrentDictionary<string, bool> _writableCache = new ConcurrentDictionary<string, bool>();
 
-        public ExtractionTask(ILogManager logManager)
+        // 本次运行实际写出的 theme.mp3 数量（跳过/已存在不计）。只有 > 0 时才触发媒体库扫描。
+        private int _created;
+
+        public ExtractionTask(ILogManager logManager, ILibraryManager libraryManager)
         {
             _logger = logManager.GetLogger("LocalThemeExtractor");
+            _libraryManager = libraryManager;
         }
 
         public IEnumerable<TaskTriggerInfo> GetDefaultTriggers()
@@ -42,7 +48,7 @@ namespace LocalThemeExtractor
             }
             catch (System.IO.FileNotFoundException ex)
             {
-                _logger.Error("[LTE] 缺少依赖: {0}。这通常由其他插件（如 StrmAssistant）引起，不影响本插件功能。请检查 Emby 安装完整性。", ex.FileName ?? ex.Message);
+                _logger.Error("[LTE] 缺少依赖: {0}。这通常由其他插件引起，不影响本插件功能。请检查 Emby 安装完整性。", ex.FileName ?? ex.Message);
             }
             catch (Exception ex)
             {
@@ -63,11 +69,17 @@ namespace LocalThemeExtractor
 
             var tracker = new FailureTracker(3);
 
+            _created = 0;
+
             _logger.Info("[LTE] 任务开始。线程={0}，媒体库={1}",
                 config.MaxParallelism,
                 enabledLibs == null ? "全部" : string.Join(",", enabledLibs));
 
             progress.Report(0);
+
+            // 提取阶段占 0-95，末尾的媒体库扫描占 95-100，这样扫描期间进度条还在动。
+            // 下面三个阶段内部仍按 0-100 报进度，由 SubProgress 折算。
+            var work = new SubProgress(progress, 0, 95);
 
             // ── TV (intro markers) ─────────────────────────────────────
             var processedSeriesIds = new HashSet<long>();
@@ -75,18 +87,45 @@ namespace LocalThemeExtractor
                            config.TvExtractIntro ? 50 : 0;
 
             if (config.TvExtractIntro)
-                processedSeriesIds = await ProcessTv(config, enabledLibs, tracker, progress, 0, tvEnd, cancellationToken);
+                processedSeriesIds = await ProcessTv(config, enabledLibs, tracker, work, 0, tvEnd, cancellationToken);
 
             // ── TV fallback (credits) ──────────────────────────────────
             double tvFallbackEnd = config.MovieExtractCredits ? 50 : 100;
             if (config.TvFallbackToCredits)
                 await ProcessTvFallback(config, enabledLibs, processedSeriesIds, tracker,
-                    progress, tvEnd, tvFallbackEnd, cancellationToken);
+                    work, tvEnd, tvFallbackEnd, cancellationToken);
 
             // ── Movies ─────────────────────────────────────────────────
             double movieFrom = (config.TvExtractIntro || config.TvFallbackToCredits) ? 50 : 0;
             if (config.MovieExtractCredits)
-                await ProcessMovies(config, enabledLibs, tracker, progress, movieFrom, 100, cancellationToken);
+                await ProcessMovies(config, enabledLibs, tracker, work, movieFrom, 100, cancellationToken);
+
+            // ── 触发媒体库扫描 ─────────────────────────────────────────
+            // Emby 只在媒体库扫描时登记新的 theme.mp3；不扫的话文件已经在盘上、界面里
+            // 却听不到。只在本次真的写出过文件时才扫，避免每次空跑都拖一遍全库扫描。
+            if (_created > 0)
+            {
+                _logger.Info("[LTE] 本次写出 {0} 个主题曲，开始扫描媒体库以登记", _created);
+                try
+                {
+                    await _libraryManager.ValidateMediaLibrary(
+                        new SubProgress(progress, 95, 100), cancellationToken);
+                    _logger.Info("[LTE] 媒体库扫描完成");
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // 文件已经写好了，扫描失败不影响成果，手动扫一次即可
+                    _logger.Error("[LTE] 媒体库扫描失败（文件已写入，手动扫描一次即可）：{0}", ex.Message);
+                }
+            }
+            else
+            {
+                _logger.Info("[LTE] 本次没有新写出主题曲，跳过媒体库扫描");
+            }
 
             progress.Report(100);
             _logger.Info("[LTE] 任务完成");
@@ -100,13 +139,21 @@ namespace LocalThemeExtractor
             CancellationToken ct)
         {
             var seriesList = LibraryDbHelper.GetIntroEpisodesPerSeries(
-                config.TvPreferSeasonNumber, config.TvMinIntroSeconds, enabledLibs);
+                config.TvPreferSeasonNumber, config.TvPreferEpisodeNumber,
+                config.TvMinIntroSeconds, enabledLibs,
+                out int skippedNoTargetEp, out HashSet<long> allSeriesWithIntro);
 
-            _logger.Info("[LTE] 电视剧：共 {0} 个系列有片头标记", seriesList.Count);
+            string seasonDesc = config.TvPreferSeasonNumber > 0
+                ? "S" + config.TvPreferSeasonNumber.ToString("D2")
+                : "最早有标记的季";
+            _logger.Info("[LTE] 电视剧：{0} 个系列命中 {1}E{2:D2}",
+                seriesList.Count, seasonDesc, config.TvPreferEpisodeNumber);
+            if (skippedNoTargetEp > 0)
+                _logger.Info("[LTE] 电视剧：{0} 个系列有片头标记但采样集不合格，整部跳过（不参与片尾回退）", skippedNoTargetEp);
 
-            var allSeriesWithIntro = new HashSet<long>();
-            foreach (var item in seriesList)
-                allSeriesWithIntro.Add(item.Item1.SeriesItemId);
+            // 排除表用「所有有片头标记的系列」（含被跳过的）——被 E02 规则跳过的剧
+            // 是「不采」，不是「改用片尾回退采」；否则回退线会给它们写上错误的片尾曲，
+            // 还会因默认不覆盖而永久堵死日后的正确提取。
 
             var pending = new List<(LibraryDbHelper.EpisodeInfo, LibraryDbHelper.IntroMarker)>();
             int skippedBlacklist = 0;
@@ -439,7 +486,7 @@ namespace LocalThemeExtractor
 
         // ── Helpers ──────────────────────────────────────────────────────
 
-        private static void WriteThemeFile(string outputPath, byte[] data)
+        private void WriteThemeFile(string outputPath, byte[] data)
         {
             string dir = Path.GetDirectoryName(outputPath);
             if (!string.IsNullOrEmpty(dir))
@@ -447,6 +494,8 @@ namespace LocalThemeExtractor
             if (File.Exists(outputPath))
                 File.Delete(outputPath);
             File.WriteAllBytes(outputPath, data);
+            // 计数放在这里而不是三个调用点，保证不会漏
+            Interlocked.Increment(ref _created);
         }
 
         private async Task RunParallel<T>(
@@ -550,6 +599,40 @@ namespace LocalThemeExtractor
             var parts = path.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
             int take = Math.Min(3, parts.Length);
             return "/" + string.Join("/", parts, 0, take);
+        }
+
+        /// <summary>
+        /// 把子任务的 0-100 进度映射到父进度条的一段区间上。
+        /// 不用 System.Progress&lt;T&gt;：它是异步投递的，多线程并发上报会乱序，
+        /// 导致进度条来回跳。这里同步转发，并且只升不降。
+        /// </summary>
+        private sealed class SubProgress : IProgress<double>
+        {
+            private readonly IProgress<double> _parent;
+            private readonly double _from;
+            private readonly double _to;
+            private readonly object _lock = new object();
+            private double _last;
+
+            public SubProgress(IProgress<double> parent, double from, double to)
+            {
+                _parent = parent;
+                _from = from;
+                _to = to;
+                _last = from;
+            }
+
+            public void Report(double value)
+            {
+                double clamped = Math.Max(0, Math.Min(100, value));
+                double pct = _from + (_to - _from) * clamped / 100.0;
+                lock (_lock)
+                {
+                    if (pct <= _last) return;
+                    _last = pct;
+                }
+                _parent.Report(pct);
+            }
         }
     }
 }

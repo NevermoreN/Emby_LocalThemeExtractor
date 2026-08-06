@@ -77,8 +77,10 @@ namespace LocalThemeExtractor
             // saving bandwidth on CloudDrive (avoids reading interleaved video data)
             // No -hwaccel needed: audio-only extraction has no video decode
             // -map 0:a:0 = first audio stream only (multi-track files won't fail)
+            // -ar 48000: 绝大多数影视音轨本身就是 48kHz，保持原采样率，避免多做一次
+            // 48k→44.1k 的有损重采样
             string args = string.Format(CultureInfo.InvariantCulture,
-                "-ss {0:F3} -i \"{1}\" -t {2:F3} -map 0:a:0 -acodec libmp3lame -ab {3}k -ar 44100 -f mp3 -y pipe:1",
+                "-ss {0:F3} -i \"{1}\" -t {2:F3} -map 0:a:0 -acodec libmp3lame -ab {3}k -ar 48000 -f mp3 -y pipe:1",
                 startSec, sourceUrl, duration, bitrateKbps);
 
             logger.Info("[LTE] ffmpeg pipe extract: {0}s-{1}s from {2}", startSec, endSec, sourceUrl);
