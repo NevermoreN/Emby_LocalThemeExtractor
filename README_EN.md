@@ -25,6 +25,7 @@ An Emby plugin that extracts theme songs from local media files using ffmpeg —
 - **Multi-Library Selection**: GenericEdit UI with multi-select library picker
 - **Post-Run Library Scan**: Automatically triggers a library scan when new theme.mp3 files were written, so Emby registers them immediately (no scan on empty runs)
 - **48 kHz Output**: MP3 keeps the native 48 kHz sample rate of film/TV audio instead of resampling to 44.1 kHz
+- **Undecodable-Track Avoidance**: Chinese 4K WEB-DLs often put an Audio Vivid (av3a) track first, which ffmpeg cannot decode; the plugin probes with ffprobe and automatically picks the first decodable track (DTS/EAC3/AAC/...) instead
 
 ## Installation
 

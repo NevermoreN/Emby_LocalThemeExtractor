@@ -43,6 +43,47 @@ namespace LocalThemeExtractor
             }
         }
 
+        // ── Pick a decodable audio stream ───────────────────────────────
+
+        /// <summary>
+        /// Audio-relative index of the first stream ffmpeg can actually decode.
+        /// 国产 4K WEB-DL（QHstudIo/OurTV 等）常把 Audio Vivid（菁彩声，tag av3a）放在
+        /// 第一条音轨，ffmpeg 无此解码器，-map 0:a:0 会以 "no decoder found for: none"
+        /// 瞬间失败；ffprobe 里这类轨的 codec_name 是 unknown/空。跳过它们选第一条
+        /// 正常轨。探测不到就返回 0（维持旧行为）。
+        /// </summary>
+        public static async Task<int> GetDecodableAudioIndexAsync(
+            string sourceUrl, ILogger logger, CancellationToken ct)
+        {
+            string probe = FfmpegPath?.Replace("ffmpeg", "ffprobe");
+            if (probe == null || !File.Exists(probe)) return 0;
+
+            string args = string.Format(
+                "-v error -select_streams a -show_entries stream=index,codec_name -of csv=p=0 \"{0}\"",
+                sourceUrl);
+            string output = await RunProcessCaptureStdoutAsync(probe, args, logger, ct);
+            if (string.IsNullOrEmpty(output)) return 0;
+
+            // 每行一条音频轨（"文件流号,codec_name"），行序即音频相对序。
+            // 行首永远有流号，codec_name 缺失时为空 —— 以行计数保证索引对齐。
+            int rel = 0;
+            foreach (var rawLine in output.Split('\n'))
+            {
+                var line = rawLine.Trim();
+                if (line.Length == 0) continue;
+                int comma = line.IndexOf(',');
+                string codec = comma >= 0 ? line.Substring(comma + 1).Trim() : "";
+                if (codec.Length > 0 &&
+                    !codec.Equals("unknown", StringComparison.OrdinalIgnoreCase) &&
+                    !codec.Equals("none", StringComparison.OrdinalIgnoreCase))
+                {
+                    return rel;
+                }
+                rel++;
+            }
+            return 0;
+        }
+
         // ── Extract audio to memory (pipe:1) ────────────────────────────
 
         /// <summary>
@@ -76,12 +117,14 @@ namespace LocalThemeExtractor
             // -map 0:a instead of -vn: tells demuxer to only read audio packets,
             // saving bandwidth on CloudDrive (avoids reading interleaved video data)
             // No -hwaccel needed: audio-only extraction has no video decode
-            // -map 0:a:0 = first audio stream only (multi-track files won't fail)
             // -ar 48000: 绝大多数影视音轨本身就是 48kHz，保持原采样率，避免多做一次
             // 48k→44.1k 的有损重采样
+            int aIdx = await GetDecodableAudioIndexAsync(sourceUrl, logger, ct);
+            if (aIdx > 0)
+                logger.Info("[LTE] 首音轨不可解码（av3a 菁彩声等），改用音轨 {0}", aIdx);
             string args = string.Format(CultureInfo.InvariantCulture,
-                "-ss {0:F3} -i \"{1}\" -t {2:F3} -map 0:a:0 -acodec libmp3lame -ab {3}k -ar 48000 -f mp3 -y pipe:1",
-                startSec, sourceUrl, duration, bitrateKbps);
+                "-ss {0:F3} -i \"{1}\" -t {2:F3} -map 0:a:{4} -acodec libmp3lame -ab {3}k -ar 48000 -f mp3 -y pipe:1",
+                startSec, sourceUrl, duration, bitrateKbps, aIdx);
 
             logger.Info("[LTE] ffmpeg pipe extract: {0}s-{1}s from {2}", startSec, endSec, sourceUrl);
             return await RunFfmpegPipeAsync(args, logger, ct);
@@ -101,10 +144,11 @@ namespace LocalThemeExtractor
 
             double scanStart = Math.Max(0, totalDurationSec - lookbackSec);
 
-            // -map 0:a:0: first audio stream only, skips video I/O entirely
+            // silencedetect 需要真解码，同样必须避开 av3a 等不可解码的首音轨
+            int aIdx = await GetDecodableAudioIndexAsync(sourceUrl, logger, ct);
             string args = string.Format(CultureInfo.InvariantCulture,
-                "-ss {0:F0} -i \"{1}\" -map 0:a:0 -af \"silencedetect=noise=-35dB:d=1.5\" -f null -",
-                scanStart, sourceUrl);
+                "-ss {0:F0} -i \"{1}\" -map 0:a:{2} -af \"silencedetect=noise=-35dB:d=1.5\" -f null -",
+                scanStart, sourceUrl, aIdx);
 
             logger.Info("[LTE] silencedetect (audio only, last {0}s): {1}", lookbackSec, sourceUrl);
 
